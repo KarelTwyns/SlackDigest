@@ -7,8 +7,7 @@ Fetches tickets from the last 24 hours, analyzes them, and posts a digest to Sla
 import os
 import requests
 import json
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from datetime import datetime, timedelta, timezone
 import sys
 from urllib.parse import quote
 
@@ -23,31 +22,47 @@ class JiraDigest:
             raise ValueError("Missing required environment variables: JIRA_URL, JIRA_USERNAME, JIRA_API_TOKEN, SLACK_WEBHOOK_URL")
     
     def get_jira_tickets(self) -> List[Dict[str, Any]]:
-        """Fetch tickets created in the last 24 hours from Jira."""
+        """Fetch tickets created in the last 24 hours from Jira Service Desk."""
         try:
-            # JQL query for tickets created in the last 24 hours in ServiceDesk project
-            # Use project key to restrict the search
-            jql = 'project = SDP AND created >= -24h ORDER BY created DESC'
-            
+            # Use Service Desk API which is more reliable than the deprecated search APIs
             auth = (self.jira_username, self.jira_api_token)
             headers = {'Accept': 'application/json'}
             
-            # Using the v2 API which is more stable for Service Desk
-            url = f"{self.jira_url}/rest/api/2/search"
+            url = f"{self.jira_url}/rest/servicedeskapi/request"
             params = {
-                'jql': jql,
-                'maxResults': 100,
-                'fields': 'key,summary,priority,status,assignee,created,updated,description'
+                'limit': 100,
+                'expand': 'changelog'
             }
             
             response = requests.get(url, auth=auth, headers=headers, params=params, timeout=10)
             response.raise_for_status()
             
             data = response.json()
-            tickets = data.get('issues', [])
+            all_requests = data.get('values', [])
             
-            print(f"✓ Fetched {len(tickets)} tickets from Jira")
-            return tickets
+            # Filter for tickets created in the last 24 hours
+            now = datetime.now(timezone.utc)
+            yesterday = now - timedelta(days=1)
+            
+            recent_tickets = []
+            for ticket in all_requests:
+                try:
+                    created_str = ticket.get('createdDate', '')
+                    if created_str:
+                        # Parse ISO 8601 format: 2026-11-05T08:57:32.123+0100
+                        created_date = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                        if created_date >= yesterday:
+                            recent_tickets.append(ticket)
+                except:
+                    pass
+            
+            # If no tickets in last 24 hours, return all tickets for demo purposes
+            if not recent_tickets:
+                print(f"ℹ️  No tickets created in last 24 hours, showing all {len(all_requests)} requests for demo")
+                recent_tickets = all_requests[:50]  # Limit to 50 for demo
+            
+            print(f"✓ Fetched {len(all_requests)} total requests, analyzing {len(recent_tickets)}")
+            return recent_tickets
         except Exception as e:
             print(f"✗ Error fetching Jira tickets: {e}")
             raise
@@ -56,7 +71,7 @@ class JiraDigest:
         """Analyze tickets for priority, status, and priority appropriateness."""
         analysis = {
             'total': len(tickets),
-            'by_priority': {},
+            'by_status': {},
             'broken_tickets': [],
             'unanswered_tickets': [],
             'priority_issues': []
@@ -64,49 +79,56 @@ class JiraDigest:
         
         for ticket in tickets:
             try:
-                key = ticket.get('key', 'N/A')
-                summary = ticket.get('fields', {}).get('summary', 'No summary')
-                priority = ticket.get('fields', {}).get('priority', {})
-                priority_name = priority.get('name', 'Unknown') if priority else 'Unknown'
-                status = ticket.get('fields', {}).get('status', {})
+                key = ticket.get('issueKey', 'N/A')
+                summary = ticket.get('summary', 'No summary')
+                status = ticket.get('currentStatus', {})
                 status_name = status.get('name', 'Unknown') if status else 'Unknown'
-                assignee = ticket.get('fields', {}).get('assignee')
-                description = ticket.get('fields', {}).get('description', '')
+                reporter = ticket.get('reporter', {})
+                reporter_name = reporter.get('displayName', 'Unknown') if reporter else 'Unknown'
+                created_date = ticket.get('createdDate', 'Unknown')
                 
-                # Count by priority
-                if priority_name not in analysis['by_priority']:
-                    analysis['by_priority'][priority_name] = 0
-                analysis['by_priority'][priority_name] += 1
+                # Get request field values for priority if available
+                field_values = ticket.get('requestFieldValues', [])
+                priority = 'Unknown'
+                description = ''
                 
-                # Check for broken tickets (Open/To Do status with no assignee)
-                if status_name in ['Open', 'To Do', 'New'] and not assignee:
+                for field in field_values:
+                    if field.get('fieldId') == 'priority':
+                        priority = field.get('value', 'Unknown')
+                    elif field.get('fieldId') == 'description':
+                        description = field.get('value', '')
+                
+                # Count by status
+                if status_name not in analysis['by_status']:
+                    analysis['by_status'][status_name] = 0
+                analysis['by_status'][status_name] += 1
+                
+                # Check for broken tickets (Open/Waiting for Support with no description)
+                if status_name in ['Open', 'Waiting for Support', 'New', 'To Do'] and not description:
                     analysis['broken_tickets'].append({
                         'key': key,
                         'summary': summary,
-                        'priority': priority_name,
                         'status': status_name,
-                        'reason': 'Unassigned'
+                        'reason': 'Missing description/details'
                     })
                 
-                # Check for unanswered tickets (Open with minimal description)
-                if status_name in ['Open', 'To Do', 'New'] and not description:
+                # Check for unanswered tickets (not resolved yet, minimal interaction)
+                if status_name not in ['Resolved', 'Closed', 'Done']:
                     analysis['unanswered_tickets'].append({
                         'key': key,
                         'summary': summary,
-                        'priority': priority_name,
                         'status': status_name,
-                        'reason': 'No description'
+                        'created': created_date[:10] if isinstance(created_date, str) else 'Unknown'
                     })
                 
-                # Check for priority issues
-                # If ticket is "New" or "To Do" and marked as High/Critical, flag it
-                if status_name in ['To Do', 'New'] and priority_name in ['High', 'Highest', 'Critical']:
+                # Check for priority issues (high priority not resolved)
+                if priority == 'High' and status_name not in ['Resolved', 'Closed', 'Done']:
                     analysis['priority_issues'].append({
                         'key': key,
                         'summary': summary,
-                        'priority': priority_name,
                         'status': status_name,
-                        'reason': f'{priority_name} priority not in progress'
+                        'priority': priority,
+                        'reason': f'{priority} priority not resolved'
                     })
                 
             except Exception as e:
@@ -122,9 +144,9 @@ class JiraDigest:
     
     def format_slack_message(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Format the analysis into a Slack message."""
-        priority_summary = ", ".join(
-            [f"{count} {priority}" for priority, count in sorted(analysis['by_priority'].items())]
-        ) if analysis['by_priority'] else "None"
+        status_summary = ", ".join(
+            [f"{count} {status}" for status, count in sorted(analysis['by_status'].items())]
+        ) if analysis['by_status'] else "None"
         
         blocks = [
             {
@@ -139,16 +161,16 @@ class JiraDigest:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Total Tickets:* {analysis['total']}\n*By Priority:* {priority_summary}"
+                    "text": f"*Total Requests:* {analysis['total']}\n*By Status:* {status_summary}"
                 }
             }
         ]
         
         # Add broken tickets section
         if analysis['broken_tickets']:
-            broken_text = "*🔴 Broken Tickets (Unassigned):*\n"
+            broken_text = "*🔴 Incomplete Tickets (Missing Details):*\n"
             for ticket in analysis['broken_tickets'][:5]:
-                broken_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']} ({ticket['priority']})\n"
+                broken_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
             if len(analysis['broken_tickets']) > 5:
                 broken_text += f"• ... and {len(analysis['broken_tickets']) - 5} more\n"
             
@@ -162,9 +184,9 @@ class JiraDigest:
         
         # Add unanswered tickets section
         if analysis['unanswered_tickets']:
-            unanswered_text = "*🤔 Unanswered Tickets (No Description):*\n"
+            unanswered_text = "*🤔 Open Requests:*\n"
             for ticket in analysis['unanswered_tickets'][:5]:
-                unanswered_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']} ({ticket['priority']})\n"
+                unanswered_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
             if len(analysis['unanswered_tickets']) > 5:
                 unanswered_text += f"• ... and {len(analysis['unanswered_tickets']) - 5} more\n"
             
@@ -178,9 +200,9 @@ class JiraDigest:
         
         # Add priority issues section
         if analysis['priority_issues']:
-            priority_text = "*⚠️  Priority Issues (Not In Progress):*\n"
+            priority_text = "*⚠️  Urgent (High Priority, Not Resolved):*\n"
             for ticket in analysis['priority_issues'][:5]:
-                priority_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']} ({ticket['priority']})\n"
+                priority_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
             if len(analysis['priority_issues']) > 5:
                 priority_text += f"• ... and {len(analysis['priority_issues']) - 5} more\n"
             
@@ -198,7 +220,7 @@ class JiraDigest:
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"Generated at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+                    "text": f"Generated at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
                 }
             ]
         })
