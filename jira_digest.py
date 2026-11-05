@@ -24,21 +24,113 @@ class JiraDigest:
     def get_jira_tickets(self) -> List[Dict[str, Any]]:
         """Fetch tickets created in the last 24 hours from Jira Service Desk."""
         try:
-            # Use Service Desk API which is more reliable than the deprecated search APIs
             auth = (self.jira_username, self.jira_api_token)
             headers = {'Accept': 'application/json'}
             
-            url = f"{self.jira_url}/rest/servicedeskapi/request"
-            params = {
-                'limit': 100,
-                'expand': 'changelog'
-            }
+            all_requests = []
             
-            response = requests.get(url, auth=auth, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
+            # First, try the Service Desk API (catches regular requests)
+            try:
+                url = f"{self.jira_url}/rest/servicedeskapi/request"
+                params = {
+                    'limit': 500,
+                    'expand': 'changelog'
+                }
+                
+                response = requests.get(url, auth=auth, headers=headers, params=params, timeout=10)
+                response.raise_for_status()
+                
+                data = response.json()
+                sd_requests = data.get('values', [])
+                print(f"✓ Fetched {len(sd_requests)} Service Desk requests")
+                
+                # Convert to common format
+                for ticket in sd_requests:
+                    created_obj = ticket.get('createdDate', {})
+                    if isinstance(created_obj, dict):
+                        created_str = created_obj.get('iso8601', '')
+                    else:
+                        created_str = str(created_obj)
+                    
+                    all_requests.append({
+                        'key': ticket.get('issueKey'),
+                        'summary': ticket.get('summary'),
+                        'created': created_str,
+                        'status': ticket.get('currentStatus', {}).get('name', 'Unknown'),
+                        'reporter': ticket.get('reporter', {}).get('displayName', 'Unknown'),
+                        'type': 'Service Desk',
+                        'raw': ticket
+                    })
+            except Exception as e:
+                print(f"Warning: Error fetching Service Desk requests: {e}")
             
-            data = response.json()
-            all_requests = data.get('values', [])
+            # Also try fetching recent issues directly by checking a range of issue IDs
+            # This catches tickets created via email or other sources
+            try:
+                # Get the highest issue number from Service Desk requests
+                if all_requests:
+                    max_id = max([int(req['key'].split('-')[1]) for req in all_requests if '-' in req['key']])
+                else:
+                    max_id = 12257  # Default known highest from SD API
+                
+                print(f"ℹ️  Checking for recent issues (highest known ID: {max_id})")
+                
+                # Fetch FORWARD from max_id to find newer issues (more efficient than scanning backwards)
+                recently_fetched = set()
+                issues_checked = 0
+                consecutive_404 = 0
+                
+                for issue_id in range(max_id + 1, max_id + 500):  # Check next 500 IDs
+                    key = f"SDP-{issue_id}"
+                    
+                    url = f"{self.jira_url}/rest/api/2/issue/{key}"
+                    
+                    try:
+                        response = requests.get(url, auth=auth, headers=headers, timeout=2)
+                        issues_checked += 1
+                        
+                        if response.status_code == 200:
+                            consecutive_404 = 0  # Reset counter
+                            issue = response.json()
+                            fields = issue.get('fields', {})
+                            created_str = fields.get('created', '')
+                            
+                            # Check if created in last 24 hours
+                            now = datetime.now(timezone.utc)
+                            yesterday = now - timedelta(days=1)
+                            if created_str:
+                                created_date = datetime.fromisoformat(created_str)
+                                if created_date.tzinfo is None:
+                                    created_date = created_date.replace(tzinfo=timezone.utc)
+                                if created_date >= yesterday:
+                                    # Check if not already in list
+                                    if key not in {req['key'] for req in all_requests}:
+                                        all_requests.append({
+                                            'key': key,
+                                            'summary': fields.get('summary'),
+                                            'created': created_str,
+                                            'status': fields.get('status', {}).get('name', 'Unknown'),
+                                            'reporter': fields.get('reporter', {}).get('displayName', 'Unknown'),
+                                            'type': 'Issue',
+                                            'raw': issue
+                                        })
+                                        recently_fetched.add(key)
+                        
+                        elif response.status_code == 404:
+                            consecutive_404 += 1
+                            # If we've seen 50 consecutive 404s, stop scanning
+                            if consecutive_404 > 50:
+                                break
+                    
+                    except:
+                        pass
+                
+                print(f"  Scanned {issues_checked} issue IDs")
+                if recently_fetched:
+                    print(f"✓ Found {len(recently_fetched)} recent issues: {', '.join(sorted(recently_fetched))}")
+                
+            except Exception as e:
+                print(f"Warning: Error scanning for recent issues: {e}")
             
             # Filter for tickets created in the last 24 hours
             now = datetime.now(timezone.utc)
@@ -47,21 +139,24 @@ class JiraDigest:
             recent_tickets = []
             for ticket in all_requests:
                 try:
-                    created_str = ticket.get('createdDate', '')
+                    created_str = ticket.get('created', '')
                     if created_str:
-                        # Parse ISO 8601 format: 2026-11-05T08:57:32.123+0100
-                        created_date = datetime.fromisoformat(created_str.replace('Z', '+00:00'))
+                        # Parse ISO 8601 format
+                        created_date = datetime.fromisoformat(created_str)
+                        # Ensure timezone-aware for comparison
+                        if created_date.tzinfo is None:
+                            created_date = created_date.replace(tzinfo=timezone.utc)
                         if created_date >= yesterday:
                             recent_tickets.append(ticket)
-                except:
+                except Exception as e:
                     pass
             
-            # If no tickets in last 24 hours, return all tickets for demo purposes
-            if not recent_tickets:
-                print(f"ℹ️  No tickets created in last 24 hours, showing all {len(all_requests)} requests for demo")
-                recent_tickets = all_requests[:50]  # Limit to 50 for demo
+            # If no tickets in last 24 hours from these APIs, fall back to Service Desk requests
+            if not recent_tickets and all_requests:
+                print(f"ℹ️  No tickets created in last 24 hours, showing recent {min(len(all_requests), 50)} requests")
+                recent_tickets = all_requests[:50]
             
-            print(f"✓ Fetched {len(all_requests)} total requests, analyzing {len(recent_tickets)}")
+            print(f"✓ Found {len(recent_tickets)} tickets from last 24 hours")
             return recent_tickets
         except Exception as e:
             print(f"✗ Error fetching Jira tickets: {e}")
@@ -79,56 +174,47 @@ class JiraDigest:
         
         for ticket in tickets:
             try:
-                key = ticket.get('issueKey', 'N/A')
+                key = ticket.get('key', 'N/A')
                 summary = ticket.get('summary', 'No summary')
-                status = ticket.get('currentStatus', {})
-                status_name = status.get('name', 'Unknown') if status else 'Unknown'
-                reporter = ticket.get('reporter', {})
-                reporter_name = reporter.get('displayName', 'Unknown') if reporter else 'Unknown'
-                created_date = ticket.get('createdDate', 'Unknown')
+                status = ticket.get('status', 'Unknown')
+                reporter = ticket.get('reporter', 'Unknown')
+                ticket_type = ticket.get('type', 'Unknown')
                 
-                # Get request field values for priority if available
-                field_values = ticket.get('requestFieldValues', [])
-                priority = 'Unknown'
+                # Get raw ticket for additional fields
+                raw_ticket = ticket.get('raw', {})
+                
+                # Extract description/details
                 description = ''
-                
-                for field in field_values:
-                    if field.get('fieldId') == 'priority':
-                        priority = field.get('value', 'Unknown')
-                    elif field.get('fieldId') == 'description':
-                        description = field.get('value', '')
+                if ticket_type == 'Service Desk':
+                    field_values = raw_ticket.get('requestFieldValues', [])
+                    for field in field_values:
+                        if field.get('fieldId') == 'description':
+                            description = field.get('value', '')
+                else:
+                    description = raw_ticket.get('fields', {}).get('description', '')
                 
                 # Count by status
-                if status_name not in analysis['by_status']:
-                    analysis['by_status'][status_name] = 0
-                analysis['by_status'][status_name] += 1
+                if status not in analysis['by_status']:
+                    analysis['by_status'][status] = 0
+                analysis['by_status'][status] += 1
                 
-                # Check for broken tickets (Open/Waiting for Support with no description)
-                if status_name in ['Open', 'Waiting for Support', 'New', 'To Do'] and not description:
+                # Check for broken tickets (Open with no description)
+                if status in ['Open', 'Waiting for Support', 'New', 'To Do', 'OPEN'] and not description:
                     analysis['broken_tickets'].append({
                         'key': key,
                         'summary': summary,
-                        'status': status_name,
+                        'status': status,
+                        'type': ticket_type,
                         'reason': 'Missing description/details'
                     })
                 
-                # Check for unanswered tickets (not resolved yet, minimal interaction)
-                if status_name not in ['Resolved', 'Closed', 'Done']:
+                # Check for unanswered tickets (not resolved)
+                if status not in ['Resolved', 'Closed', 'Done', 'CLOSED']:
                     analysis['unanswered_tickets'].append({
                         'key': key,
                         'summary': summary,
-                        'status': status_name,
-                        'created': created_date[:10] if isinstance(created_date, str) else 'Unknown'
-                    })
-                
-                # Check for priority issues (high priority not resolved)
-                if priority == 'High' and status_name not in ['Resolved', 'Closed', 'Done']:
-                    analysis['priority_issues'].append({
-                        'key': key,
-                        'summary': summary,
-                        'status': status_name,
-                        'priority': priority,
-                        'reason': f'{priority} priority not resolved'
+                        'status': status,
+                        'type': ticket_type
                     })
                 
             except Exception as e:
@@ -138,7 +224,6 @@ class JiraDigest:
         print(f"✓ Analyzed {len(tickets)} tickets")
         print(f"  - Broken tickets: {len(analysis['broken_tickets'])}")
         print(f"  - Unanswered tickets: {len(analysis['unanswered_tickets'])}")
-        print(f"  - Priority issues: {len(analysis['priority_issues'])}")
         
         return analysis
     
