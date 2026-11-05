@@ -8,6 +8,7 @@ import os
 import requests
 import json
 from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any
 import sys
 from urllib.parse import quote
 
@@ -167,10 +168,14 @@ class JiraDigest:
         analysis = {
             'total': len(tickets),
             'by_status': {},
+            'needs_discussion': [],
+            'routine': [],
             'broken_tickets': [],
-            'unanswered_tickets': [],
-            'priority_issues': []
+            'unanswered_tickets': []
         }
+        
+        auth = (self.jira_username, self.jira_api_token)
+        headers = {'Accept': 'application/json'}
         
         for ticket in tickets:
             try:
@@ -217,15 +222,124 @@ class JiraDigest:
                         'type': ticket_type
                     })
                 
+                # Assess if ticket needs team discussion
+                needs_discussion_assessment = self.assess_discussion_need(
+                    key, summary, description, status, ticket_type
+                )
+                
+                if needs_discussion_assessment['needs_discussion']:
+                    analysis['needs_discussion'].append({
+                        'key': key,
+                        'summary': summary,
+                        'reason': needs_discussion_assessment['reason'],
+                        'priority': needs_discussion_assessment.get('priority', 'Normal')
+                    })
+                else:
+                    analysis['routine'].append({
+                        'key': key,
+                        'summary': summary
+                    })
+                
             except Exception as e:
                 print(f"Warning: Error analyzing ticket: {e}")
                 continue
         
         print(f"✓ Analyzed {len(tickets)} tickets")
+        print(f"  - Needs discussion: {len(analysis['needs_discussion'])}")
+        print(f"  - Routine: {len(analysis['routine'])}")
         print(f"  - Broken tickets: {len(analysis['broken_tickets'])}")
         print(f"  - Unanswered tickets: {len(analysis['unanswered_tickets'])}")
         
         return analysis
+    
+    def assess_discussion_need(self, key: str, summary: str, description: str, status: str, ticket_type: str) -> Dict[str, Any]:
+        """
+        Assess whether a ticket needs team discussion.
+        
+        Returns: {
+            'needs_discussion': bool,
+            'reason': str,
+            'priority': str  # 'High', 'Normal', 'Low'
+        }
+        """
+        
+        # Combine summary and description for analysis
+        full_text = f"{summary} {description}".lower()
+        
+        # Keywords that indicate routine issues (no discussion needed)
+        routine_keywords = [
+            'cjib',  # CJIB exports explicitly don't need discussion
+            'export',  # General export issues
+            'missing export',
+            'export gegevens',
+            'fout bij export',
+            'boetegegevens',
+            'data export'
+        ]
+        
+        # Check if this is a routine CJIB/export issue
+        if any(keyword in full_text for keyword in routine_keywords):
+            return {
+                'needs_discussion': False,
+                'reason': 'Routine export/CJIB issue'
+            }
+        
+        # Keywords that indicate discussion is needed
+        discussion_keywords = [
+            'crash',
+            'bug',
+            'error',
+            'fout',
+            'niet werkend',
+            'gebroken',
+            'broken',
+            'not working',
+            'failed',
+            'failure',
+            'identiteit',  # Identity issues
+            'authentication',
+            'login',
+            'access denied',
+            'permission',
+            'sync',
+            'synchron'
+        ]
+        
+        # Check if discussion is needed
+        if any(keyword in full_text for keyword in discussion_keywords):
+            # Determine priority
+            critical_keywords = ['crash', 'critical', 'urgent', 'production']
+            if any(keyword in full_text for keyword in critical_keywords):
+                priority = 'High'
+            else:
+                priority = 'Normal'
+            
+            return {
+                'needs_discussion': True,
+                'reason': 'Potential bug or system issue requiring team review',
+                'priority': priority
+            }
+        
+        # Check for unclear/vague issues (indicate discussion needed)
+        if len(full_text.strip()) < 20:
+            return {
+                'needs_discussion': True,
+                'reason': 'Unclear problem statement - needs clarification',
+                'priority': 'Normal'
+            }
+        
+        # Default: needs discussion if we're not sure
+        if status in ['Open', 'New', 'To Do', 'OPEN']:
+            return {
+                'needs_discussion': True,
+                'reason': 'New open issue - awaiting team triage',
+                'priority': 'Normal'
+            }
+        
+        return {
+            'needs_discussion': False,
+            'reason': 'No discussion needed'
+        }
     
     def format_slack_message(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Format the analysis into a Slack message."""
@@ -251,9 +365,41 @@ class JiraDigest:
             }
         ]
         
-        # Add broken tickets section
+        # Add tickets needing team discussion (HIGH PRIORITY)
+        if analysis['needs_discussion']:
+            discussion_text = "*🔴 NEEDS TEAM DISCUSSION:*\n"
+            for ticket in analysis['needs_discussion']:
+                priority_emoji = "🔴" if ticket.get('priority') == 'High' else "🟡"
+                discussion_text += f"{priority_emoji} <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
+                discussion_text += f"   _Reason:_ {ticket['reason']}\n"
+            
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": discussion_text
+                }
+            })
+        
+        # Add routine tickets
+        if analysis['routine']:
+            routine_text = "*✅ Routine Issues (No Discussion Needed):*\n"
+            for ticket in analysis['routine'][:5]:
+                routine_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
+            if len(analysis['routine']) > 5:
+                routine_text += f"• ... and {len(analysis['routine']) - 5} more routine issues\n"
+            
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": routine_text
+                }
+            })
+        
+        # Add broken tickets section (if any)
         if analysis['broken_tickets']:
-            broken_text = "*🔴 Incomplete Tickets (Missing Details):*\n"
+            broken_text = "*⚠️  Incomplete Tickets (Missing Details):*\n"
             for ticket in analysis['broken_tickets'][:5]:
                 broken_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
             if len(analysis['broken_tickets']) > 5:
@@ -267,37 +413,15 @@ class JiraDigest:
                 }
             })
         
-        # Add unanswered tickets section
-        if analysis['unanswered_tickets']:
-            unanswered_text = "*🤔 Open Requests:*\n"
-            for ticket in analysis['unanswered_tickets'][:5]:
-                unanswered_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
-            if len(analysis['unanswered_tickets']) > 5:
-                unanswered_text += f"• ... and {len(analysis['unanswered_tickets']) - 5} more\n"
-            
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": unanswered_text
-                }
-            })
-        
-        # Add priority issues section
-        if analysis['priority_issues']:
-            priority_text = "*⚠️  Urgent (High Priority, Not Resolved):*\n"
-            for ticket in analysis['priority_issues'][:5]:
-                priority_text += f"• <{self.jira_url}/browse/{ticket['key']}|{ticket['key']}> - {ticket['summary']}\n"
-            if len(analysis['priority_issues']) > 5:
-                priority_text += f"• ... and {len(analysis['priority_issues']) - 5} more\n"
-            
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": priority_text
-                }
-            })
+        # Add summary section
+        summary_text = f"*Summary:* {len(analysis['needs_discussion'])} issues need discussion, {len(analysis['routine'])} are routine"
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": summary_text
+            }
+        })
         
         # Add footer
         blocks.append({
