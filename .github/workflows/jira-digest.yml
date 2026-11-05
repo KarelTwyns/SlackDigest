@@ -1,0 +1,40 @@
+name: Jira Service Desk Digest
+
+on:
+  # Run every day at 9 AM UTC (10 AM CET)
+  schedule:
+    - cron: '0 9 * * *'
+  
+  # Allow manual trigger from Actions tab
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    name: Generate and Post Jira Digest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run Jira digest automation
+        env:
+          JIRA_URL: ${{ secrets.JIRA_URL }}
+          JIRA_USERNAME: ${{ secrets.JIRA_USERNAME }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python3 jira_digest.py
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Jira digest workflow failed!"
+          exit 1
