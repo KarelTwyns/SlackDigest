@@ -1,0 +1,9 @@
+version: 1
+
+# Enable GitHub Copilot for this repository
+copilot:
+  enabled: true
+  
+# Optional: Configure which AI model to use for automation
+ai:
+  model: auto
