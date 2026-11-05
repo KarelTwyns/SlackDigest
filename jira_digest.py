@@ -13,7 +13,11 @@ import sys
 from urllib.parse import quote
 
 class JiraDigest:
-    def __init__(self):
+    def __init__(self, config_path: str = 'digest-config.json'):
+        # Load configuration
+        self.config = self._load_config(config_path)
+        
+        # Environment variables
         self.jira_url = os.getenv('JIRA_URL')
         self.jira_username = os.getenv('JIRA_USERNAME')
         self.jira_api_token = os.getenv('JIRA_API_TOKEN')
@@ -21,6 +25,27 @@ class JiraDigest:
         
         if not all([self.jira_url, self.jira_username, self.jira_api_token, self.slack_webhook_url]):
             raise ValueError("Missing required environment variables: JIRA_URL, JIRA_USERNAME, JIRA_API_TOKEN, SLACK_WEBHOOK_URL")
+    
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """Load configuration from JSON file."""
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            print(f"⚠️  Config file not found at {config_path}, using defaults")
+            return {
+                'analysis': {
+                    'discussion_keywords': ['crash', 'bug', 'error', 'broken', 'failed'],
+                    'routine_keywords': ['cjib', 'export'],
+                    'critical_keywords': ['crash', 'critical', 'urgent'],
+                    'min_chars_for_vague_check': 20
+                },
+                'jira': {
+                    'hours_lookback': 24,
+                    'max_id_scan_range': 500,
+                    'consecutive_404_threshold': 50
+                }
+            }
     
     def get_jira_tickets(self) -> List[Dict[str, Any]]:
         """Fetch tickets created in the last 24 hours from Jira Service Desk."""
@@ -254,7 +279,7 @@ class JiraDigest:
     
     def assess_discussion_need(self, key: str, summary: str, description: str, status: str, ticket_type: str) -> Dict[str, Any]:
         """
-        Assess whether a ticket needs team discussion.
+        Assess whether a ticket needs team discussion based on configured keywords.
         
         Returns: {
             'needs_discussion': bool,
@@ -266,49 +291,23 @@ class JiraDigest:
         # Combine summary and description for analysis
         full_text = f"{summary} {description}".lower()
         
-        # Keywords that indicate routine issues (no discussion needed)
-        routine_keywords = [
-            'cjib',  # CJIB exports explicitly don't need discussion
-            'export',  # General export issues
-            'missing export',
-            'export gegevens',
-            'fout bij export',
-            'boetegegevens',
-            'data export'
-        ]
+        # Load keywords from config
+        analysis_config = self.config.get('analysis', {})
+        routine_keywords = analysis_config.get('routine_keywords', ['cjib', 'export'])
+        discussion_keywords = analysis_config.get('discussion_keywords', ['crash', 'bug', 'error'])
+        critical_keywords = analysis_config.get('critical_keywords', ['crash', 'critical', 'urgent'])
+        min_chars = analysis_config.get('min_chars_for_vague_check', 20)
         
-        # Check if this is a routine CJIB/export issue
+        # Check if this is a routine issue (no discussion needed)
         if any(keyword in full_text for keyword in routine_keywords):
             return {
                 'needs_discussion': False,
-                'reason': 'Routine export/CJIB issue'
+                'reason': 'Routine issue'
             }
         
-        # Keywords that indicate discussion is needed
-        discussion_keywords = [
-            'crash',
-            'bug',
-            'error',
-            'fout',
-            'niet werkend',
-            'gebroken',
-            'broken',
-            'not working',
-            'failed',
-            'failure',
-            'identiteit',  # Identity issues
-            'authentication',
-            'login',
-            'access denied',
-            'permission',
-            'sync',
-            'synchron'
-        ]
-        
-        # Check if discussion is needed
+        # Check if discussion is needed based on keywords
         if any(keyword in full_text for keyword in discussion_keywords):
             # Determine priority
-            critical_keywords = ['crash', 'critical', 'urgent', 'production']
             if any(keyword in full_text for keyword in critical_keywords):
                 priority = 'High'
             else:
@@ -321,7 +320,7 @@ class JiraDigest:
             }
         
         # Check for unclear/vague issues (indicate discussion needed)
-        if len(full_text.strip()) < 20:
+        if len(full_text.strip()) < min_chars:
             return {
                 'needs_discussion': True,
                 'reason': 'Unclear problem statement - needs clarification',
