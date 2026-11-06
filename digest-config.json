@@ -1,0 +1,57 @@
+{
+  "digest": {
+    "name": "Jira Service Desk Digest",
+    "description": "Daily digest of Jira Service Desk tickets with team discussion assessment"
+  },
+  "analysis": {
+    "discussion_keywords": [
+      "crash",
+      "bug",
+      "error",
+      "fout",
+      "niet werkend",
+      "gebroken",
+      "broken",
+      "not working",
+      "failed",
+      "failure",
+      "identiteit",
+      "authentication",
+      "login",
+      "access denied",
+      "permission",
+      "sync",
+      "synchron"
+    ],
+    "routine_keywords": [
+      "cjib",
+      "export",
+      "missing export",
+      "export gegevens",
+      "fout bij export",
+      "boetegegevens",
+      "data export"
+    ],
+    "critical_keywords": [
+      "crash",
+      "critical",
+      "urgent",
+      "production"
+    ],
+    "min_chars_for_vague_check": 20
+  },
+  "slack": {
+    "show_routine_section": true,
+    "max_routine_items_shown": 5,
+    "show_broken_tickets": true,
+    "emoji_high_priority": "🔴",
+    "emoji_normal_priority": "🟡",
+    "emoji_routine": "✅",
+    "emoji_broken": "⚠️"
+  },
+  "jira": {
+    "hours_lookback": 24,
+    "max_id_scan_range": 500,
+    "consecutive_404_threshold": 50
+  }
+}
